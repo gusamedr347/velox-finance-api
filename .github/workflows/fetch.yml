@@ -1,0 +1,35 @@
+name: Fetch quotes
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run fetcher
+        env:
+          ZOHO_URL: ${{ secrets.ZOHO_URL }}
+          ZOHO_LIST_URL: ${{ secrets.ZOHO_LIST_URL }}
+          TICKERS: ${{ secrets.TICKERS }}
+        run: python fetch_quotes.py
+      - name: Touch heartbeat file
+        if: always()
+        run: |
+          date -u +%FT%TZ > .heartbeat
+          git config user.name "github-actions[bot]"
+          git config user.email "[email protected]"
+          git add .heartbeat
+          git commit -m "heartbeat" || exit 0
+          git push
