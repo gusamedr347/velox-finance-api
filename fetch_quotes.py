@@ -2,20 +2,25 @@
 Fetch stock/forex/crypto quotes from Yahoo Finance via yfinance
 and push them to a Zoho Creator Custom API endpoint.
 
+Special case: the 'USDT' ticker is sourced from exchangemonitor.net's
+Binance USD/VES rate, since Yahoo doesn't carry a meaningful USDT/VES quote.
+
 Environment variables:
     ZOHO_URL       — Custom API endpoint for receiveQuote (with ?publickey=...)
     ZOHO_LIST_URL  — Custom API endpoint for listTickers  (with ?publickey=...) [optional]
     TICKERS        — comma-separated fallback list if ZOHO_LIST_URL is unset or fails
 """
 
-import time
 import os
 import json
 import sys
+import time
 from datetime import datetime, timezone
 
 import requests
 import yfinance as yf
+
+from usdt_scraper import scrape_binance_rate
 
 
 ZOHO_URL      = os.environ["ZOHO_URL"]
@@ -27,9 +32,8 @@ ZOHO_LIST_URL = os.environ.get("ZOHO_LIST_URL")
 # ----------------------------------------------------------------------
 
 def safe(v, default=0):
-    """Coerce None/NaN to default; otherwise return as-is."""
     try:
-        if v is None or v != v:  # None or NaN
+        if v is None or v != v:
             return default
         return v
     except Exception:
@@ -37,7 +41,6 @@ def safe(v, default=0):
 
 
 def safe_str(v, default=""):
-    """Coerce None to empty string, then to str."""
     if v is None:
         return default
     try:
@@ -48,7 +51,6 @@ def safe_str(v, default=""):
 
 
 def fattr(fast_info, name, default=None):
-    """Safe attribute access on yfinance's FastInfo object."""
     try:
         v = getattr(fast_info, name, None)
         if v is None or v != v:
@@ -59,7 +61,6 @@ def fattr(fast_info, name, default=None):
 
 
 def epoch_to_iso(epoch):
-    """Convert a Unix timestamp (int or str) to ISO 8601 string. Empty string if unparseable."""
     if epoch is None or epoch == "" or epoch == 0:
         return ""
     try:
@@ -67,6 +68,26 @@ def epoch_to_iso(epoch):
         return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     except Exception:
         return ""
+
+
+def empty_payload(symbol: str) -> dict:
+    """Skeleton payload with all fields zeroed/blank — used as a starting point for non-Yahoo sources."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {
+        "symbol": symbol,
+        "bid": 0, "ask": 0, "last": 0, "volume": 0,
+        "bidSize": 0, "askSize": 0,
+        "avgVol52": 0, "high52": 0, "low52": 0,
+        "fechaUltimo": now_iso, "barTime": today,
+        "open": 0, "high": 0, "low": 0, "close": 0, "barVolume": 0,
+        "change52WPct": 0, "regularChange": 0, "regularChangePct": 0,
+        "sharesOutstanding": 0,
+        "longName": "", "currency": "", "country": "",
+        "fullExchangeName": "", "typeDisp": "",
+        "beta": 0,
+        "dividendDate": "", "dividendRate": 0, "dividendYield": 0,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -94,7 +115,40 @@ def get_tickers() -> list[str]:
 
 
 # ----------------------------------------------------------------------
-# Yahoo fetch
+# Source: exchangemonitor.net (USDT/VES via Binance)
+# ----------------------------------------------------------------------
+
+def fetch_usdt() -> dict | None:
+    """Scrape the USDT/VES rate from exchangemonitor.net. Returns a Zoho-shaped payload or None on failure."""
+    try:
+        rate = scrape_binance_rate()
+        bid  = rate["compra"]
+        ask  = rate["venta"]
+        last = (bid + ask) / 2.0  # midpoint as 'last' price
+
+        payload = empty_payload("USDT")
+        payload.update({
+            "bid":              bid,
+            "ask":              ask,
+            "last":             last,
+            "open":             last,
+            "high":             last,
+            "low":              last,
+            "close":            last,
+            "longName":         "Tether USD / Venezuelan Bolívar (Binance)",
+            "currency":         "VES",
+            "country":          "Venezuela",
+            "fullExchangeName": "Binance P2P",
+            "typeDisp":         "CRYPTOCURRENCY",
+        })
+        return payload
+    except Exception as e:
+        print(f"[USDT] scrape failed: {e}", file=sys.stderr)
+        return None
+
+
+# ----------------------------------------------------------------------
+# Source: Yahoo Finance (everything else)
 # ----------------------------------------------------------------------
 
 def fetch_one(symbol: str) -> dict | None:
@@ -117,7 +171,6 @@ def fetch_one(symbol: str) -> dict | None:
         except Exception:
             full = {}
 
-        # Existing fields
         bid      = safe(full.get("bid"))
         ask      = safe(full.get("ask"))
         bid_size = safe(full.get("bidSize"))
@@ -133,7 +186,6 @@ def fetch_one(symbol: str) -> dict | None:
         low52      = safe(low52      or full.get("fiftyTwoWeekLow"))
         avg_vol_52 = safe(avg_vol_52 or full.get("averageVolume"), 0)
 
-        # New fields
         change_52w_pct      = safe(full.get("fiftyTwoWeekChangePercent"))
         regular_change      = safe(full.get("regularMarketChange"))
         regular_change_pct  = safe(full.get("regularMarketChangePercent"))
@@ -155,7 +207,6 @@ def fetch_one(symbol: str) -> dict | None:
         today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         return {
-            # Existing
             "symbol":              symbol,
             "bid":                 bid,
             "ask":                 ask,
@@ -173,7 +224,6 @@ def fetch_one(symbol: str) -> dict | None:
             "low":                 day_low,
             "close":               last,
             "barVolume":           volume,
-            # New
             "change52WPct":        change_52w_pct,
             "regularChange":       regular_change,
             "regularChangePct":    regular_change_pct,
@@ -190,6 +240,17 @@ def fetch_one(symbol: str) -> dict | None:
         }
     except Exception:
         return None
+
+
+# ----------------------------------------------------------------------
+# Dispatcher
+# ----------------------------------------------------------------------
+
+def fetch_symbol(symbol: str) -> dict | None:
+    """Route each symbol to its appropriate data source."""
+    if symbol.upper() == "USDT":
+        return fetch_usdt()
+    return fetch_one(symbol)
 
 
 # ----------------------------------------------------------------------
@@ -231,7 +292,7 @@ def main():
         sym = sym.strip()
         if not sym:
             continue
-        data = fetch_one(sym)
+        data = fetch_symbol(sym)
         if data is None:
             skipped += 1
             skipped_symbols.append(sym)
@@ -244,7 +305,7 @@ def main():
     elapsed = time.monotonic() - start
     print(f"\nDone. ok={ok} skipped={skipped} push_failed={pushed_failed} — took {elapsed:.1f}s")
     if skipped_symbols:
-        print(f"Skipped (no Yahoo data): {', '.join(skipped_symbols)}")
+        print(f"Skipped (no data): {', '.join(skipped_symbols)}")
 
     if pushed_failed and not ok:
         sys.exit(1)
