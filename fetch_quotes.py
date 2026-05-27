@@ -4,10 +4,11 @@ and push them to a Zoho Creator Custom API endpoint.
 
 Environment variables:
     ZOHO_URL       — Custom API endpoint for receiveQuote (with ?publickey=...)
-    ZOHO_LIST_URL  — Custom API endpoint for listTickers (with ?publickey=...) [optional]
+    ZOHO_LIST_URL  — Custom API endpoint for listTickers  (with ?publickey=...) [optional]
     TICKERS        — comma-separated fallback list if ZOHO_LIST_URL is unset or fails
 """
 
+import time
 import os
 import json
 import sys
@@ -17,7 +18,7 @@ import requests
 import yfinance as yf
 
 
-ZOHO_URL      = os.environ.get("ZOHO_URL")
+ZOHO_URL      = os.environ["ZOHO_URL"]
 ZOHO_LIST_URL = os.environ.get("ZOHO_LIST_URL")
 
 
@@ -35,6 +36,17 @@ def safe(v, default=0):
         return default
 
 
+def safe_str(v, default=""):
+    """Coerce None to empty string, then to str."""
+    if v is None:
+        return default
+    try:
+        s = str(v).strip()
+        return s if s else default
+    except Exception:
+        return default
+
+
 def fattr(fast_info, name, default=None):
     """Safe attribute access on yfinance's FastInfo object."""
     try:
@@ -46,17 +58,27 @@ def fattr(fast_info, name, default=None):
         return default
 
 
+def epoch_to_iso(epoch):
+    """Convert a Unix timestamp (int or str) to ISO 8601 string. Empty string if unparseable."""
+    if epoch is None or epoch == "" or epoch == 0:
+        return ""
+    try:
+        ts = int(epoch)
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return ""
+
+
 # ----------------------------------------------------------------------
 # Ticker list from Zoho
 # ----------------------------------------------------------------------
 
 def get_tickers() -> list[str]:
-    """Fetch ticker list from Zoho. Falls back to TICKERS env var if Zoho list URL isn't set or fails."""
     if ZOHO_LIST_URL:
         try:
             r = requests.get(ZOHO_LIST_URL, timeout=15)
             r.raise_for_status()
-            outer = r.json()  # {"code": 3000, "result": "<json string>"}
+            outer = r.json()
             inner_str = outer.get("result", "{}")
             inner = json.loads(inner_str) if isinstance(inner_str, str) else inner_str
             symbols = inner.get("symbols", [])
@@ -90,18 +112,17 @@ def fetch_one(symbol: str) -> dict | None:
         low52      = fattr(fi, "year_low")
         avg_vol_52 = fattr(fi, "three_month_average_volume", 0)
 
-        # Always fetch .info — fast_info doesn't include bid/ask/bidSize/askSize
         try:
             full = t.info or {}
         except Exception:
             full = {}
 
+        # Existing fields
         bid      = safe(full.get("bid"))
         ask      = safe(full.get("ask"))
         bid_size = safe(full.get("bidSize"))
         ask_size = safe(full.get("askSize"))
 
-        # Final fallback chain
         last       = safe(last       or full.get("regularMarketPrice"))
         volume     = safe(volume     or full.get("regularMarketVolume"))
         day_high   = safe(day_high   or full.get("regularMarketDayHigh"), last)
@@ -112,34 +133,62 @@ def fetch_one(symbol: str) -> dict | None:
         low52      = safe(low52      or full.get("fiftyTwoWeekLow"))
         avg_vol_52 = safe(avg_vol_52 or full.get("averageVolume"), 0)
 
+        # New fields
+        change_52w_pct      = safe(full.get("fiftyTwoWeekChangePercent"))
+        regular_change      = safe(full.get("regularMarketChange"))
+        regular_change_pct  = safe(full.get("regularMarketChangePercent"))
+        shares_outstanding  = safe(full.get("sharesOutstanding"), 0)
+        long_name           = safe_str(full.get("longName"))
+        currency            = safe_str(full.get("currency"))
+        country             = safe_str(full.get("country"))
+        full_exchange_name  = safe_str(full.get("fullExchangeName"))
+        type_disp           = safe_str(full.get("typeDisp"))
+        beta                = safe(full.get("beta"))
+        dividend_date_iso   = epoch_to_iso(full.get("dividendDate"))
+        dividend_rate       = safe(full.get("dividendRate"))
+        dividend_yield      = safe(full.get("dividendYield"))
+
         if not last:
-            # Symbol doesn't exist on Yahoo or returned no price data — skip silently
             return None
 
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         return {
-            "symbol":       symbol,
-            "bid":          bid,
-            "ask":          ask,
-            "last":         last,
-            "volume":       volume,
-            "bidSize":      bid_size,
-            "askSize":      ask_size,
-            "avgVol52":     avg_vol_52,
-            "high52":       high52,
-            "low52":        low52,
-            "fechaUltimo":  now_iso,
-            "barTime":      today,
-            "open":         day_open,
-            "high":         day_high,
-            "low":          day_low,
-            "close":        last,
-            "barVolume":    volume,
+            # Existing
+            "symbol":              symbol,
+            "bid":                 bid,
+            "ask":                 ask,
+            "last":                last,
+            "volume":              volume,
+            "bidSize":             bid_size,
+            "askSize":             ask_size,
+            "avgVol52":            avg_vol_52,
+            "high52":              high52,
+            "low52":               low52,
+            "fechaUltimo":         now_iso,
+            "barTime":             today,
+            "open":                day_open,
+            "high":                day_high,
+            "low":                 day_low,
+            "close":               last,
+            "barVolume":           volume,
+            # New
+            "change52WPct":        change_52w_pct,
+            "regularChange":       regular_change,
+            "regularChangePct":    regular_change_pct,
+            "sharesOutstanding":   shares_outstanding,
+            "longName":            long_name,
+            "currency":            currency,
+            "country":             country,
+            "fullExchangeName":    full_exchange_name,
+            "typeDisp":            type_disp,
+            "beta":                beta,
+            "dividendDate":        dividend_date_iso,
+            "dividendRate":        dividend_rate,
+            "dividendYield":       dividend_yield,
         }
     except Exception:
-        # Symbol not found, network blip, yfinance internal error — skip silently
         return None
 
 
@@ -166,9 +215,11 @@ def push_to_zoho(payload: dict) -> bool:
 # ----------------------------------------------------------------------
 
 def main():
+    start = time.monotonic()
+
     tickers = get_tickers()
     if not tickers:
-        print("No tickers to fetch. Set TICKERS env var or configure ZOHO_LIST_URL.", file=sys.stderr)
+        print("No tickers to fetch.", file=sys.stderr)
         sys.exit(1)
 
     print(f"Fetching {len(tickers)} tickers at {datetime.now(timezone.utc).isoformat()}")
@@ -190,7 +241,8 @@ def main():
         else:
             pushed_failed += 1
 
-    print(f"\nDone. ok={ok} skipped={skipped} push_failed={pushed_failed}")
+    elapsed = time.monotonic() - start
+    print(f"\nDone. ok={ok} skipped={skipped} push_failed={pushed_failed} — took {elapsed:.1f}s")
     if skipped_symbols:
         print(f"Skipped (no Yahoo data): {', '.join(skipped_symbols)}")
 
