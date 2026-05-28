@@ -1,13 +1,13 @@
 """
-Fetch stock/forex/crypto quotes from Yahoo Finance via yfinance
-and push them to a Zoho Creator Custom API endpoint.
+Fetch stock/forex/crypto quotes from Yahoo Finance (and Binance P2P for USDT)
+and push them to a Zoho Creator Custom API endpoint in a single batched call.
 
-Special case: the 'USDT' ticker is sourced from exchangemonitor.net's
-Binance USD/VES rate, since Yahoo doesn't carry a meaningful USDT/VES quote.
+Special case: the 'USDT' ticker is sourced from Binance's public P2P API
+(USD/VES rate), since Yahoo doesn't carry a meaningful USDT/VES quote.
 
 Environment variables:
-    ZOHO_URL       — Custom API endpoint for receiveQuote (with ?publickey=...)
-    ZOHO_LIST_URL  — Custom API endpoint for listTickers  (with ?publickey=...) [optional]
+    ZOHO_BATCH_URL — Custom API endpoint for receiveQuotesBatch (with ?publickey=...)
+    ZOHO_LIST_URL  — Custom API endpoint for listTickers        (with ?publickey=...) [optional]
     TICKERS        — comma-separated fallback list if ZOHO_LIST_URL is unset or fails
 """
 
@@ -23,8 +23,8 @@ import yfinance as yf
 from usdt_scraper import scrape_binance_rate
 
 
-ZOHO_URL      = os.environ["ZOHO_URL"]
-ZOHO_LIST_URL = os.environ.get("ZOHO_LIST_URL")
+ZOHO_BATCH_URL = os.environ["ZOHO_BATCH_URL"]
+ZOHO_LIST_URL  = os.environ.get("ZOHO_LIST_URL")
 
 
 # ----------------------------------------------------------------------
@@ -71,7 +71,7 @@ def epoch_to_iso(epoch):
 
 
 def empty_payload(symbol: str) -> dict:
-    """Skeleton payload with all fields zeroed/blank — used as a starting point for non-Yahoo sources."""
+    """Skeleton payload with all fields zeroed/blank — starting point for non-Yahoo sources."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return {
@@ -115,16 +115,15 @@ def get_tickers() -> list[str]:
 
 
 # ----------------------------------------------------------------------
-# Source: exchangemonitor.net (USDT/VES via Binance)
+# Source: Binance P2P (USDT/VES)
 # ----------------------------------------------------------------------
 
 def fetch_usdt() -> dict | None:
-    """Scrape the USDT/VES rate from exchangemonitor.net. Returns a Zoho-shaped payload or None on failure."""
     try:
         rate = scrape_binance_rate()
         bid  = rate["compra"]
         ask  = rate["venta"]
-        last = (bid + ask) / 2.0  # midpoint as 'last' price
+        last = (bid + ask) / 2.0
 
         payload = empty_payload("USDT")
         payload.update({
@@ -135,7 +134,7 @@ def fetch_usdt() -> dict | None:
             "high":             last,
             "low":              last,
             "close":            last,
-            "longName":         "Tether USD / Venezuelan Bolívar (Binance)",
+            "longName":         "Tether USD / Venezuelan Bolivar (Binance P2P)",
             "currency":         "VES",
             "country":          "Venezuela",
             "fullExchangeName": "Binance P2P",
@@ -143,12 +142,12 @@ def fetch_usdt() -> dict | None:
         })
         return payload
     except Exception as e:
-        print(f"[USDT] scrape failed: {e}", file=sys.stderr)
+        print(f"[USDT] fetch failed: {e}", file=sys.stderr)
         return None
 
 
 # ----------------------------------------------------------------------
-# Source: Yahoo Finance (everything else)
+# Source: Yahoo Finance
 # ----------------------------------------------------------------------
 
 def fetch_one(symbol: str) -> dict | None:
@@ -247,27 +246,26 @@ def fetch_one(symbol: str) -> dict | None:
 # ----------------------------------------------------------------------
 
 def fetch_symbol(symbol: str) -> dict | None:
-    """Route each symbol to its appropriate data source."""
     if symbol.upper() == "USDT":
         return fetch_usdt()
     return fetch_one(symbol)
 
 
 # ----------------------------------------------------------------------
-# Push to Zoho
+# Push to Zoho (single batched call)
 # ----------------------------------------------------------------------
 
-def push_to_zoho(payload: dict) -> bool:
+def push_batch_to_zoho(payloads: list[dict]) -> bool:
     try:
         r = requests.post(
-            ZOHO_URL,
-            files={"payload": (None, json.dumps(payload))},
-            timeout=20,
+            ZOHO_BATCH_URL,
+            files={"payload": (None, json.dumps(payloads))},
+            timeout=60,
         )
-        print(f"[{payload['symbol']}] Zoho {r.status_code}: {r.text[:200]}")
+        print(f"Zoho batch {r.status_code}: {r.text[:300]}")
         return r.ok
     except Exception as e:
-        print(f"[{payload['symbol']}] push failed: {e}", file=sys.stderr)
+        print(f"Batch push failed: {e}", file=sys.stderr)
         return False
 
 
@@ -285,7 +283,7 @@ def main():
 
     print(f"Fetching {len(tickers)} tickers at {datetime.now(timezone.utc).isoformat()}")
 
-    ok = skipped = pushed_failed = 0
+    payloads = []
     skipped_symbols = []
 
     for sym in tickers:
@@ -294,20 +292,19 @@ def main():
             continue
         data = fetch_symbol(sym)
         if data is None:
-            skipped += 1
             skipped_symbols.append(sym)
-            continue
-        if push_to_zoho(data):
-            ok += 1
         else:
-            pushed_failed += 1
+            payloads.append(data)
+
+    pushed_ok = push_batch_to_zoho(payloads) if payloads else False
 
     elapsed = time.monotonic() - start
-    print(f"\nDone. ok={ok} skipped={skipped} push_failed={pushed_failed} — took {elapsed:.1f}s")
+    print(f"\nDone. fetched={len(payloads)} skipped={len(skipped_symbols)} "
+          f"pushed={'ok' if pushed_ok else 'FAIL'} — took {elapsed:.1f}s")
     if skipped_symbols:
         print(f"Skipped (no data): {', '.join(skipped_symbols)}")
 
-    if pushed_failed and not ok:
+    if not pushed_ok and payloads:
         sys.exit(1)
 
 

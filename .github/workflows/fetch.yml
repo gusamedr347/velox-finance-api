@@ -16,7 +16,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run fetcher
         env:
-          ZOHO_URL: ${{ secrets.ZOHO_URL }}
+          ZOHO_BATCH_URL: ${{ secrets.ZOHO_BATCH_URL }}
           ZOHO_LIST_URL: ${{ secrets.ZOHO_LIST_URL }}
           TICKERS: ${{ secrets.TICKERS }}
         run: python fetch_quotes.py
