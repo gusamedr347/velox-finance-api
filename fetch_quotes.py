@@ -255,18 +255,30 @@ def fetch_symbol(symbol: str) -> dict | None:
 # Push to Zoho (single batched call)
 # ----------------------------------------------------------------------
 
+CHUNK_SIZE = 15  # quotes per Zoho call — tune down if you still hit MORE_THAN_MAX_LENGTH
+
+
 def push_batch_to_zoho(payloads: list[dict]) -> bool:
-    try:
-        r = requests.post(
-            ZOHO_BATCH_URL,
-            files={"payload": (None, json.dumps(payloads))},
-            timeout=60,
-        )
-        print(f"Zoho batch {r.status_code}: {r.text[:300]}")
-        return r.ok
-    except Exception as e:
-        print(f"Batch push failed: {e}", file=sys.stderr)
-        return False
+    """Send quotes to Zoho in chunks to stay under the per-parameter length limit."""
+    all_ok = True
+    total = len(payloads)
+    chunks = [payloads[i:i + CHUNK_SIZE] for i in range(0, total, CHUNK_SIZE)]
+
+    for idx, chunk in enumerate(chunks, start=1):
+        try:
+            r = requests.post(
+                ZOHO_BATCH_URL,
+                files={"payload": (None, json.dumps(chunk))},
+                timeout=60,
+            )
+            print(f"  Chunk {idx}/{len(chunks)} ({len(chunk)} quotes) — Zoho {r.status_code}: {r.text[:150]}")
+            if not r.ok:
+                all_ok = False
+        except Exception as e:
+            print(f"  Chunk {idx}/{len(chunks)} push failed: {e}", file=sys.stderr)
+            all_ok = False
+
+    return all_ok
 
 
 # ----------------------------------------------------------------------
